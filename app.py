@@ -3,11 +3,13 @@ import datetime
 import re
 import sqlite3
 from random import randint
+
+from jwt import ExpiredSignatureError, InvalidTokenError
 from zxcvbn import zxcvbn
 
 from authy.api import AuthyApiClient
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
-from flask_jwt_extended import JWTManager
+from flask_jwt_extended import JWTManager, create_access_token, decode_token
 from flask_mail import Mail, Message
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -627,93 +629,76 @@ def verify_email_otp():
 @app.route('/password_reset', methods=['GET', 'POST'])
 def password_reset():
     if request.method == 'POST':
-        if 'username' in request.form and 'email' in request.form:
-            user_name = request.form['username']
-            user_email = request.form['email']
-            # Establish a connection to your SQLite database file.
-            connection = sqlite3.connect("verfications_database.db")
-            # Create a cursor using the connection.
-            cursor = connection.cursor()
-            cursor.execute("SELECT * FROM accounts WHERE username = ? AND email = ?", (user_name, user_email))
-            details = cursor.fetchone()
-            if details is None:
-                return ({"message": "Invalid username or email address"}), 401
-            else:
-                # api.phones.verification_start(phonenumber, country_code='91', via='sms')  # Hardcoded values, via='call'  via='sms'
-                session['username'] = user_name
-                session['user_email'] = user_email
 
-                # Generate a new 6-digit OTP
-                otp = ''.join([str(randint(0, 9)) for _ in range(6)])
+        user_email = request.form.get('email')
 
-                # Store the OTP in the session for later validation
-                session['user_otp'] = otp
+        # Check if the email exists in the database
+        connection = sqlite3.connect("verfications_database.db")
+        cursor = connection.cursor()
+        cursor.execute("SELECT * FROM accounts WHERE email = ?", (user_email,))
+        user = cursor.fetchone()
+        connection.close()
 
-                # Customize the email message with your website name and a message
-                email_message = f"Hello, This is TestSite.com. You are receiving this email to verify your account. Your OTP is below:<br><br>"
-                email_message += f'<h1 style="color: red; font-size: 36px; font-weight: bold;">{otp}</h1>'
-                email_message += "<br><br>Please use this OTP to validate your account on TestSite.com."
+        if user:
+            # Generate a JWT token containing the user's email as identity
+            token = create_access_token(identity=user_email)
 
-                # Create a message containing the customized email message and send it to the specified email
-                msg = Message(subject='OTP Verification for TestSite.com', sender='TestSite.com',
-                              recipients=[user_email])
-                msg.html = email_message
-                mail.send(msg)
+            # Debugging: Print the generated token
+            print("Generated Token:", token)
 
-                return redirect(url_for('password_reset_verification'))
-        else:
-            return ({"message": "Invalid request"}), 400
+            # Customize the email message with your website name and a message
+            email_message = f"Hello, This is TestSite.com. You are receiving this email to reset your password. Please click the link below to reset your password:<br><br>"
+            email_message += f'<a href="{url_for("reset_password", token=token, _external=True)}">Reset Password</a>'
 
-    # Display the form for GET requests
+            # Create a message containing the customized email message and send it to the specified email
+            msg = Message(subject='Password Reset for TestSite.com', sender='TestSite.com', recipients=[user_email])
+            msg.html = email_message
+            mail.send(msg)
+
+            flash("A password reset link has been sent to your email. Please check your inbox.", "success")
+
+            return redirect(url_for('login'))  # Redirect to the login page
+
+        flash("No account found with that email address. Please try again.", "error")
+
     return render_template('password_reset.html')
 
 
-@app.route("/password_reset_verification", methods=["GET", "POST"])
-def password_reset_verification():
-    if request.method == "POST":
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    try:
+        # Decode the token to retrieve the user's email as identity
+        decoded_token = decode_token(token)
+        print("Decoded Token:", decoded_token)  # Add this line for debugging
+        email = decoded_token.get('identity')  # Use .get() to avoid KeyError
 
-        user_otp = request.form.get("token")
+        if request.method == 'POST':
+            new_password = request.form.get("new_password")
+            confirm_password = request.form.get("confirm_password")
 
-        # Retrieve the stored OTP from the session
-        stored_otp = session.get('user_otp')
+            if new_password == confirm_password:
+                hashed_password = generate_password_hash(new_password)
 
-        # Check if the user-entered OTP matches the stored OTP
-        if user_otp == stored_otp:
-            return redirect(url_for('display_reset_password'))
-        else:
-            error_message = "Invalid verification code. Please try again."
-            return render_template("password_reset_verification.html", error_message=error_message)
+                # Update the password in the database
+                connection = sqlite3.connect("verfications_database.db")
+                cursor = connection.cursor()
+                cursor.execute("UPDATE accounts SET password = ? WHERE email = ?", (hashed_password, email))
+                connection.commit()
+                connection.close()
 
-    return render_template("password_reset_verification.html")
+                flash("Your password has been successfully reset. You can now log in with your new password.",
+                      "success")
+                return redirect(url_for('login'))  # Redirect to the login page
 
+            flash("Passwords do not match. Please try again.", "error")
 
-@app.route('/display_reset_password')
-def display_reset_password():
-    return render_template('reset_password.html')
-
-
-@app.route('/reset_password', methods=['POST'])
-def reset_password():
-    if 'new_password' in request.form and 'confirm_password' in request.form:
-        new_password = request.form['new_password']
-        confirm_password = request.form['confirm_password']
-
-        if new_password == confirm_password:
-            hashed_password = generate_password_hash(new_password)
-
-            username = session['username']
-            # Establish a connection to your SQLite database file.
-            connection = sqlite3.connect("verfications_database.db")
-            # Create a cursor using the connection.
-            cursor = connection.cursor()
-            cursor.execute("UPDATE accounts SET password = ? WHERE username = ?", (hashed_password, username))
-            connection.commit()
-
-            return redirect(url_for('login'))
-        else:
-            return {"message": "Passwords do not match"}, 400
-    else:
-        return {"message": "Invalid request"}, 400
+        return render_template("reset_password.html", token=token)
+    except ExpiredSignatureError:
+        flash("The password reset link has expired. Please request a new one.", "error")
+        return redirect(url_for('password_reset'))
+    except InvalidTokenError:
+        flash("Invalid password reset link. Please request a new one.", "error")
+        return redirect(url_for('password_reset'))
 
 
 # Function to check if a password change is required for a user
